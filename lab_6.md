@@ -164,5 +164,313 @@ int main()
 
 # 在0.11中实现信号量,用生产者—消费者程序检验之
 
+按照[实验二](./lab_2.md)中的步骤添加四个系统调用：
+
+```c
+sem_t* sem_open(const char *name, unsigned int value);
+int sem_wait(semt_t *sem);
+int sem_post(sem_t *sem);
+int sem_unlink(const char *name);
+```
+
+先在`include/`文件夹中添加`sem.h`头文件，内容如下：
+
+![1561698914664](lab_6/1561698914664.png)
+
+然后在`kernel/`文件夹中添加`sem.c`，内容如下：
+
+```c
+#include <sem.h>
+#include <string.h> /* strcpy()  strcmp() */
+#include <asm/segment.h>  /* get_fs_byte() */
+#include <unistd.h>  /* NULL */
+#include <asm/system.h>  /* cli()  sti() */
+#include <linux/kernel.h>  /* printk() */
+
+#define SEMS_SIZE 5
+
+sem_t sems[SEMS_SIZE] = {
+    {"", 0, NULL},
+    {"", 0, NULL},
+    {"", 0, NULL},
+    {"", 0, NULL},
+    {"", 0, NULL},
+};
+
+sem_t* sys_sem_open(const char *name, unsigned int value)
+{
+    if (name == NULL)
+    {
+        printk("name == NULL\n");
+        return NULL;
+    }
+    int i, index = -1;
+    char temp_name[MAX_NAME];
+    for (i = 0; i < MAX_NAME; ++i)
+    {
+        temp_name[i] = get_fs_byte(name+i);
+        if (temp_name[i] == '\0')
+            break;
+    }
+    if (i == 0 || i == MAX_NAME)
+    {
+        printk("i = %d\n", i);
+        return NULL;
+    }
+
+    for (i = 0; i < SEMS_SIZE; ++i)
+    {
+        if (strcmp(sems[i].name, "") == 0)
+        {
+            index = index == -1 ? i : index;
+            continue;
+        }
+        if (strcmp(sems[i].name, temp_name) == 0)
+            return &sems[i];
+    }
+    sem_t *res = NULL;
+    if (index != -1)
+    {
+        res = &sems[index];
+        strcpy(res->name, temp_name);
+        res->value = value;
+    }
+    return res;
+}
+
+int sys_sem_wait(sem_t *sem)
+{
+    if (sem == NULL || sem < sems || sem >= sems + SEMS_SIZE)
+        return -1;
+    cli();
+    while (sem->value == 0)
+        sleep_on(&sem->wait_queue);
+    sem->value--;
+    sti();
+    return 0;
+}
+
+int sys_sem_post(sem_t *sem)
+{    
+    if (sem == NULL || sem < sems || sem >= sems + SEMS_SIZE)
+        return -1;
+    cli();
+    wake_up(&sem->wait_queue);
+    sem->value++;
+    sti();
+    return 0;
+}
+
+int sys_sem_unlink(const char *name)
+{
+    if (name == NULL)
+        return -1;
+    int i; 
+    char temp_name[MAX_NAME];
+    for (i = 0; i < MAX_NAME; ++i)
+    {
+        temp_name[i] = get_fs_byte(name+i);
+        if (temp_name[i] == '\0')
+            break;
+    }
+    if (i == 0 || i == MAX_NAME)
+        return -1;
+
+    for (i = 0; i < SEMS_SIZE; ++i)
+    {
+        if (strcmp(sems[i].name, temp_name))
+        {
+            strcpy(sems[i].name, "");
+            sems[i].value = 0;
+            sems[i].wait_queue = NULL;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+```
+
+**注意，由于在`sys.h`中使用了`sem_t`这个类型，需要`#include <sem.h>`。**
+
 # 用信号量解决生产者—消费者问题
 
+上面的`pc.c`基本上不用做太大的改动即可用于Linux 0.11，注意，Linux 0.11中没有`ftruncate`、`fsync`和`snprintf`，后面两个都有可以凑合用的替代品，但是没有`ftruncate`的替代品，因此，通过修改`fcntl`实现了一个`ftruncate`（此处参考实验楼的[这里](https://www.shiyanlou.com/courses/reports/373603/))。先修改`fcntl.h`，增加一个宏定义：
+
+![1561699245393](lab_6/1561699245393.png)
+
+然后修改`fcntl.c`如下：
+
+![1561699326325](lab_6/1561699326325.png)
+
+然后重新编译内核即可。
+
+最后在Linux 0.11中的`pc.c`如下：
+
+```c
+#define __LIBRARY__
+
+#include <stdio.h>
+#include <sem.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+
+_syscall2(sem_t*, sem_open, const char*, name, unsigned int, value);
+_syscall1(int, sem_wait, sem_t*, sem);
+_syscall1(int, sem_post, sem_t*, sem);
+_syscall1(int, sem_unlink, const char*, name);
+
+#define BUFSIZE 10  
+
+#define CONSUMER_NUM 4  
+
+#define MAX_NUM 500
+
+int fd;
+sem_t *empty; 
+sem_t *full; 
+sem_t *mutex;  
+
+int ftruncate(int fd, unsigned long size)
+{
+    return fcntl(fd, F_CHGSIZE, size);
+}
+
+void producer()
+{
+    int item_num = 0;
+    while (item_num < MAX_NUM)
+    {
+        sem_wait(empty);
+        sem_wait(mutex);
+        if (lseek(fd, 0, SEEK_END) < 0)
+            fprintf(stderr, "Error in producer lseek\n");
+        write(fd, &item_num, sizeof(int));
+        sync();
+        sem_post(mutex);
+        sem_post(full);
+        ++item_num;
+    }
+    close(fd);
+}
+
+void consumer()
+{
+    int item;
+    int file_len;
+    int tmp_value;
+    int j;
+
+    do
+    {
+        sem_wait(full);
+        sem_wait(mutex);
+        if (lseek(fd, 0, SEEK_SET) < 0)
+            fprintf(stderr, "Error in consumer lseek\n");
+
+        if (read(fd, &item, sizeof(int)) == 0)
+        {
+            sem_post(mutex);
+            sem_post(empty);
+            break;
+        }
+
+        printf("%d: %d\n", getpid(), item);
+        fflush(stdout);
+
+        file_len = lseek(fd, 0, SEEK_END); 
+        if (file_len < 0)
+            fprintf(stderr, "Error when get file length\n");
+        for(j = 1; j < (file_len / sizeof(int)); j++) 
+        { 
+            lseek(fd, j * sizeof(int), SEEK_SET); 
+            read(fd, &tmp_value, sizeof(int)); 
+            lseek(fd, (j - 1) * sizeof(int), SEEK_SET); 
+            write(fd, &tmp_value, sizeof(int)); 
+        } 
+        /* ftruncate(fd, file_len - sizeof(int)); */  /* bug in here? */
+
+        sem_post(mutex);
+        sem_post(empty);
+    }while(item < MAX_NUM - 1);
+    sem_post(full);
+    close(fd);
+}
+
+int main()
+{
+    char empty_name[20];
+    char full_name[20];
+    char mutex_name[20];
+    int i;
+    pid_t p_pid;  
+
+    /* from APUE */
+    sprintf(empty_name, "/%ld_empty", (long)getpid());    
+    sprintf(full_name, "/%ld_full", (long)getpid());
+    sprintf(mutex_name, "/%ld_mutex", (long)getpid());
+
+    printf("empty_name: %s\n", empty_name);
+
+    fd = open("share.file", O_CREAT | O_RDWR | O_TRUNC, 0666);
+
+    empty = sem_open(empty_name, BUFSIZE);
+    if (empty == NULL)
+    {
+        fprintf(stderr, "Error when create empty\n");
+        exit(0);
+    }
+    full = sem_open(full_name, 0);
+    if (full == NULL)
+    {
+        fprintf(stderr, "Error when create full\n");
+        exit(0);
+    }
+    mutex = sem_open(mutex_name, 1);
+    if (mutex == NULL)
+    {
+        fprintf(stderr, "Error when create mutex\n");
+        exit(0);
+    }
+
+    printf("Create semphore OK!\n");
+
+    for (i = 0; i < CONSUMER_NUM; ++i)
+    {
+        if (!fork())
+        {
+            consumer();
+            exit(0);
+        }
+    }
+
+    if (!fork())
+    {
+        producer();
+        exit(0);
+    }
+    while (waitpid(-1, NULL, 0) > 0)
+        ;
+
+    sem_unlink(empty_name);
+    sem_unlink(full_name);
+    sem_unlink(mutex_name);
+    close(fd);
+    
+    return 0;
+}
+```
+
+**但是在这个文件中存在一个BUG？执行`pc`时会产生大量乱七八糟的输出，Bochs直接就死机了。。也不知道为啥，欢迎知道的同学告诉我哈。。**
+
+# 实验问答
+
+> 在pc.c中去掉所有与信号量有关的代码,再运行程序,执行效果有变化吗?为什么会这样?
+
+很明显，去掉进程同步结构，会造成输出混乱。因为无法保证按顺序取数据，写数据时机也不能保证。
+
+> 实验的设计者在第一次编写生产者——消费者程序的时候,是这么做的......可行吗？
+
+显然不可行，有造成死锁的可能。不能先对Mutex加锁再对Empty加锁。
