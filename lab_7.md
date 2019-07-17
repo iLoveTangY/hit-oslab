@@ -101,3 +101,154 @@ int main(void)
 完全正确！
 
 接下来通过直接修改内存来改变`i`的值，使其值为0来退出循环。命令是`setpmem 0x00fa4004 4 0`，表示从0x00fa7004地址开始的4个字节都设为0。然后再用“c”命令继续Bochs的运行，可以看到test退出了，说明i的修改成功了，此项实验结束。
+
+# 基于共享内存的生产者消费者程序
+
+主要是用`shmget()`和`shmat()`这几个函数，使用方法可以查阅`APUE`或者百度。
+
+生产者进程如下：
+
+```c
+#include <stdio.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/shm.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+#define BUFSIZE 10
+#define MAX_NUM 500
+
+// producer
+int main() 
+{
+    sem_t *empty;
+    sem_t *full;
+    sem_t *mutex;
+    int shmid;
+    int *p;
+    int i;
+
+    sem_unlink("empty");
+    sem_unlink("full");
+    sem_unlink("mutex");
+
+    empty = sem_open("empty", O_CREAT | O_EXCL, S_IRWXU, BUFSIZE);
+    if (empty == SEM_FAILED)
+    {
+        fprintf(stderr, "Error when create semaphore empty\n");
+        exit(1);
+    }
+
+    full = sem_open("full", O_CREAT | O_EXCL, S_IRWXU, 0);
+    if (full == SEM_FAILED)
+    {
+        fprintf(stderr, "Error when create semaphore full\n");
+        exit(1);
+    }
+    mutex = sem_open("mutex", O_CREAT | O_EXCL, S_IRWXU, 1);
+    if (mutex == SEM_FAILED)
+    {
+        fprintf(stderr, "Error when create semaphore mutex\n");
+        exit(1);
+    }
+    printf("Create semphore OK!\n");
+
+    if((shmid = shmget(1024, MAX_NUM * sizeof(int), IPC_CREAT | 0777)) < 0)
+    {
+        fprintf(stderr, "shmget error\n");
+        exit(1);
+    }
+
+    if((p = (int *)shmat(shmid, NULL, SHM_EXEC)) == (void *)-1)
+    {
+        fprintf(stderr, "shmat error\n");
+        exit(1);
+    }
+
+    for (i = 0; i < MAX_NUM; ++i)
+    {
+        sem_wait(empty);
+        sem_wait(mutex);
+        *(p + i % BUFSIZE) = i;
+        printf("add %d to buffer\n", i);
+        sem_post(mutex);
+        sem_post(full);
+    }
+
+    sem_unlink("empty");
+    sem_unlink("full");
+    sem_unlink("mutex");
+
+    return 0;
+}
+
+```
+
+消费者进程如下：
+
+```c
+#include <stdio.h>
+#include <semaphore.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/shm.h>
+
+#define BUFSIZE 10
+
+#define MAX_NUM 500
+
+sem_t* Sem_open(const char *name, unsigned int value)
+{
+    sem_t *sem = sem_open(name, value);
+    if (sem == SEM_FAILED)
+    {
+        fprintf(stderr, "Error when create semaphore %s\n", name);
+        exit(1);
+    }
+    return sem;
+}
+
+int main()
+{
+    int i;
+    int shmid;
+    sem_t *empty;
+    sem_t *full;
+    sem_t *mutex;
+    int *p;
+    int data;
+
+    empty = Sem_open("empty", 0);  // 使用现有信号量只需指定名字和flag参数的0值
+    full = Sem_open("full", 0);
+    mutex = Sem_open("mutex", 0);
+
+    printf("Semaphore Open Sucess!\n");
+    fflush(stdout);
+
+    shmid = shmget(1024, (BUFSIZE) * sizeof(int), IPC_CREAT | 0777);
+
+    if (shmid == -1)
+    {
+        fprintf(stderr, "shmget Error!\n");
+        exit(1);
+    }
+
+    p = (int *)shmat(shmid, NULL, SHM_EXEC);
+    for (i = 0; i < MAX_NUM; ++i)
+    {
+        sem_wait(full);
+        sem_wait(mutex);
+        data = *(p + i % BUFSIZE);
+        printf("%d: %d\n", getpid(), data);
+        fflush(stdout);
+        sem_post(mutex);
+        sem_post(empty);
+    }
+    return 0;
+}
+
+```
+
+**特别提醒：没有父子关系的进程之间进行共享内存，shmget()的第一个参数key不要用IPC_PRIVATE，否则无法共享。用什么数字可视心情而定，只要确保两个进程用的是同一个值即可。**
+
