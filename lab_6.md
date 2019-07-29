@@ -189,7 +189,7 @@ int sem_unlink(const char *name);
 
 #define SEMS_SIZE 5
 
-sem_t sems[SEMS_SIZE] = {
+static sem_t sems[SEMS_SIZE] = {
     {"", 0, NULL},
     {"", 0, NULL},
     {"", 0, NULL},
@@ -214,7 +214,7 @@ sem_t* sys_sem_open(const char *name, unsigned int value)
     }
     if (i == 0 || i == MAX_NAME)
     {
-        printk("i = %d\n", i);
+        printk("name too long or too short, i = %d\n", i);
         return NULL;
     }
 
@@ -232,9 +232,16 @@ sem_t* sys_sem_open(const char *name, unsigned int value)
     if (index != -1)
     {
         res = &sems[index];
-        strcpy(res->name, temp_name);
+        // printk("before set: name is %s\n", res->name);
+        // strcpy(sems[index].name, temp_name);  // 不能使用strcpy，是因为在内核态的原因吗？
+        for (i = 0; temp_name[i] != '\0'; ++i)
+                sems[index].name[i] = temp_name[i];
+        sems[index].name[i] = '\0';
+        // printk("after set: name is %s\n", res->name);
         res->value = value;
     }
+    else
+        printk("no empty slots: index = %d\n", index);
     return res;
 }
 
@@ -275,12 +282,13 @@ int sys_sem_unlink(const char *name)
     }
     if (i == 0 || i == MAX_NAME)
         return -1;
+    temp_name[i] = '\0';
 
     for (i = 0; i < SEMS_SIZE; ++i)
     {
         if (strcmp(sems[i].name, temp_name))
         {
-            strcpy(sems[i].name, "");
+            sems[i].name[0] = '\0';
             sems[i].value = 0;
             sems[i].wait_queue = NULL;
             return 0;
@@ -390,7 +398,7 @@ void consumer()
             lseek(fd, (j - 1) * sizeof(int), SEEK_SET); 
             write(fd, &tmp_value, sizeof(int)); 
         } 
-        /* ftruncate(fd, file_len - sizeof(int)); */  /* bug in here? */
+        ftruncate(fd, file_len - sizeof(int)); 
 
         sem_post(mutex);
         sem_post(empty);
@@ -411,8 +419,6 @@ int main()
     sprintf(empty_name, "/%ld_empty", (long)getpid());    
     sprintf(full_name, "/%ld_full", (long)getpid());
     sprintf(mutex_name, "/%ld_mutex", (long)getpid());
-
-    printf("empty_name: %s\n", empty_name);
 
     fd = open("share.file", O_CREAT | O_RDWR | O_TRUNC, 0666);
 
@@ -463,7 +469,19 @@ int main()
 }
 ```
 
-**但是在这个文件中存在一个BUG？执行`pc`时会产生大量乱七八糟的输出，Bochs直接就死机了。。也不知道为啥，欢迎知道的同学告诉我哈。。**
+~~但是在这个文件中存在一个BUG？执行`pc`时会产生大量乱七八糟的输出，Bochs直接就死机了。。也不知道为啥，欢迎知道的同学告诉我哈。。(已经解决，是之前的信号量实现问题。)~~
+
+将实验结果输出到文件中，执行以下命令：
+
+![深度截图_选择区域_20190729130246](lab_6/深度截图_选择区域_20190729130246.png)
+
+等待执行完毕后打开out.txt内容如下：
+
+![深度截图_选择区域_20190729130400](lab_6/深度截图_选择区域_20190729130400.png)
+
+![深度截图_选择区域_20190729130437](lab_6/深度截图_选择区域_20190729130437.png)
+
+试验完成。
 
 # 实验问答
 
