@@ -252,3 +252,244 @@ int main()
 
 **特别提醒：没有父子关系的进程之间进行共享内存，shmget()的第一个参数key不要用IPC_PRIVATE，否则无法共享。用什么数字可视心情而定，只要确保两个进程用的是同一个值即可。**
 
+# 在Linux0.11下实现共享内存
+
+在整个实现过程中存在着两个问题需要解决。
+
+首先，要获得物理地址非常容易，直接调用`get_free_page()`即可。但是如何在一个进程中获取一个空闲的虚拟地址，然后在页表中将虚拟地址和物理地址联系起来呢？实验指导书中提到，使用`put_page()`可以将建立虚拟地址和物理地址的映射，那么就剩下如何获得一个虚拟地址了。仔细查看注释中的图13-6，进程的PCB中保存着进程所占用的所有内存空间的信息，比如代码段起始位置，代码段结束位置，栈开始位置等等。为了获得一个虚拟地址，我们可以想想当调用`malloc()`动态分配内存空间时是如何获取虚拟地址的。我们会发现，`malloc()`获得的虚拟地址是通过递增`brk`来分配一个虚拟地址的。也就是说，`brk`维持了现在地址空间底端已经使用的虚拟地址，我们也只需要递增`brk`即可获得一块空闲的虚拟地址。另外需要注意的是，图中显示的那些地址比如`start_cdoe`、`end_code`等等都是段内偏移，因此需要先通过`get_base()`获取段基址，加上段基址后才是真正的虚拟地址。
+
+第二个问题我们先看看实现共享内存的代码：
+
+`shm.h`如下：
+
+```c
+#ifndef _SHM_H_
+#define _SHM_H_
+
+#define SHM_SIZE 20
+
+typedef struct
+{
+    unsigned int key;
+    unsigned int size;
+    unsigned long page;  // address
+}shm_t;
+
+#endif
+```
+
+`shm.c`如下：
+
+```c
+#include <shm.h>
+#include <unistd.h>
+#include <errno.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+
+static shm_t shm_list[SHM_SIZE] = {0};
+
+int sys_shmget(unsigned int key, size_t size)
+{
+    int i;
+    void *page;
+    if (size > PAGE_SIZE)
+        return -EINVAL;
+    page = get_free_page();  // get an empty physic page.
+    // printk("get free page in %p\n", page);
+    if (!page)
+        return -ENOMEM;
+    for (i = 0; i < SHM_SIZE; ++i)
+        if (shm_list[i].key == key)
+            return i;
+    // printk("create new share memory space.\n");
+    for (i = 0; i < SHM_SIZE; ++i)
+    {
+        if (shm_list[i].key == 0)  // find an empty slot.
+        {
+            shm_list[i].key = key;
+            shm_list[i].page = page;
+            shm_list[i].size = size;
+            return i;
+        }
+    }
+    // printk("no empty slot\n");
+    return -1;
+}
+
+void* sys_shmat(int shmid)
+{
+    int i;
+    void *addr;
+    if (0 < shmid || shmid > SHM_SIZE)
+        return -EINVAL;
+    addr = current->brk + get_base(current->ldt[1]);  // we can use this virtual address
+    current->brk += PAGE_SIZE;
+    // printk("get an empty virtual address in %p\n", addr);
+    if (shm_list[shmid].key != 0)
+    {
+        put_page(shm_list[shmid].page, addr);
+        incr_mem_map(shm_list[shmid].page);   // 重点
+        return current->brk - PAGE_SIZE;
+    }
+    // printk("this share memory is not exits.\n");
+
+    return -EINVAL;
+}
+```
+
+实现很简单，但是里面还存在一个问题。我们现在的生产消费者程序有两个进程，一个`producer`，一个`consumer`。他们之间共享一块物理内存。当`producer`退出时，操作系统会自动调用`free_page()`来回收这个进程使用的所有内存页，那么也会回收这块共享内存。所谓回收也就是在全局的`mem_map`表中将该物理内存对应的位置的值减一，如果为0了就真正的回收内存，标记为可用。当我们调用`get_free_page()`时只是在`mem_map`中将对应物理内存设置为1，那么`producer`退出时会减小至0，该内存已经被标记为可用了。然后，`consumer`退出，操作系统同样会尝试取释放这块共享内存，但是这块内存已经被释放了，因此会出现`trying to free free page`，接着就会宕机。因此，当我们调用`shmat`时我们需要在`mem_map`中将对应项加一，这样可以避免宕机。但是可能会出现内存泄漏？
+
+因此，我们需要在`memory.c`中增加一个对`mem_map`进行加一操作的函数，如下：
+
+```c
+void incr_mem_map(unsigned long addr)
+{
+        
+        mem_map[MAP_NR(addr)]++;
+}
+```
+
+具体为什么这么实现可以看看《注释》。
+
+接下来就是修改后的`consumer.c`和`producer.c`了，实现如下：
+
+`producer.c`
+
+```c
+#define __LIBRARY__
+
+#include <stdio.h>
+#include <sem.h>
+#include <fcntl.h>
+#include <shm.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+/* for semphare */
+_syscall2(sem_t*, sem_open, const char*, name, unsigned int, value);
+_syscall1(int, sem_wait, sem_t*, sem);
+_syscall1(int, sem_post, sem_t*, sem);
+_syscall1(int, sem_unlink, const char*, name);
+
+_syscall1(void*, shmat, int, shmid);
+_syscall2(int, shmget, unsigned int, key, size_t, size);
+
+#define BUFSIZE 10
+#define MAX_NUM 500
+
+/* producer */
+int main() 
+{
+    sem_t *empty;
+    sem_t *full;
+    sem_t *mutex;
+    int shmid;
+    int *p;
+    int i;
+
+    sem_unlink("empty");
+    sem_unlink("full");
+    sem_unlink("mutex");
+
+    empty = sem_open("empty", BUFSIZE);
+    full = sem_open("full", 0);
+    mutex = sem_open("mutex", 1);
+
+    shmget(1024, MAX_NUM * sizeof(int));
+    p = (int *)shmat(shmid);
+    
+    for (i = 0; i < MAX_NUM; ++i)
+    {
+        sem_wait(empty);
+        sem_wait(mutex);
+        *(p + i % BUFSIZE) = i;
+        printf("add %d to buffer\n", i);
+        fflush(stdout);
+        sem_post(mutex);
+        sem_post(full);
+    }
+
+    /* sem_unlink("empty");
+    sem_unlink("full");
+    sem_unlink("mutex"); */
+    printf("Producer exit\n");
+    fflush(stdout);
+
+    return 0;
+}
+```
+
+`consumer.c`
+
+```c
+#define __LIBRARY__
+
+#include <stdio.h>
+#include <sem.h>
+#include <shm.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+_syscall2(sem_t*, sem_open, const char*, name, unsigned int, value);
+_syscall1(int, sem_wait, sem_t*, sem);
+_syscall1(int, sem_post, sem_t*, sem);
+_syscall1(int, sem_unlink, const char*, name);
+
+_syscall1(void*, shmat, int, shmid);
+_syscall2(int, shmget, unsigned int, key, size_t, size);
+
+
+#define BUFSIZE 10
+
+#define MAX_NUM 500
+
+sem_t* Sem_open(const char *name, unsigned int value)
+{
+    sem_t *sem = sem_open(name, value);
+    if (sem == NULL)
+    {
+        fprintf(stderr, "Error when create semaphore %s\n", name);
+        exit(1);
+    }
+    return sem;
+}
+
+int main()
+{
+    int i;
+    int shmid;
+    sem_t *empty;
+    sem_t *full;
+    sem_t *mutex;
+    int *p;
+    int data;
+
+    empty = Sem_open("empty", BUFSIZE);
+    full = Sem_open("full", 0);
+    mutex = Sem_open("mutex", 1);
+
+    shmid = shmget(1024, (BUFSIZE) * sizeof(int));
+
+    p = (int *)shmat(shmid);
+
+    for (i = 0; i < MAX_NUM; ++i)
+    {
+        sem_wait(full);
+        sem_wait(mutex);
+        data = *(p + i % BUFSIZE);
+        printf("%d: %d\n", getpid(), data);
+        fflush(stdout);
+        sem_post(mutex);
+        sem_post(empty);
+    }
+    return 0;
+}
+
+```
+
+也没有太大的改动。
+
+另外还有一个注意点，我的这两个程序中没有对信号量进行释放，因为如果在`producer`中释放了在`consumer`中就没法访问了。当然，你可以在`consumer`中释放，但是我觉得这样并不优雅。。所以就没这样做。如果想做到释放，那么可以在信号量的实现中增加计数器，如果计数值为0了才真正释放该信号量，这样就可以比较优雅的在生产消费者程序中释放信号量了。在此我没有实现。
+
